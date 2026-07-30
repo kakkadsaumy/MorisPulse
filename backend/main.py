@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,20 +17,25 @@ client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY", "dummy-key"))
 MODEL = "gemma-4-26b-a4b-it"
 SECRET_KEY = os.environ.get("SECRET_KEY", "hackathon123")
 
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://192.168.1.XXX:11434") 
+LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "gemma4:e4b-it-q4_K_M")
+
+local_client = OpenAI(base_url=f"{OLLAMA_HOST}/v1", api_key="ollama")
+
 conversations = {}
-locations = {}  
+locations = {}
 turn_counts = {}
 reports = {}
 next_id = [1]
 
-MAX_TURNS = 4  
+MAX_TURNS = 4
 
 
 class MessageBody(BaseModel):
     message: str
     lat: float
     lng: float
-    image_base64: str | None = None  
+    image_base64: str | None = None
 
 
 class InfoBody(BaseModel):
@@ -70,6 +76,20 @@ submit_report_tool = {
     },
 }
 
+# Same tools, OpenAI-format, for the local fallback path
+local_tools = [
+    {"type": "function", "function": {
+        "name": "ask_followup",
+        "description": "Ask the citizen a clarifying question before finalizing the report.",
+        "parameters": ask_followup_tool["parameters"],
+    }},
+    {"type": "function", "function": {
+        "name": "submit_report",
+        "description": "Finalize and submit the complaint as a structured report.",
+        "parameters": submit_report_tool["parameters"],
+    }},
+]
+
 
 def build_prompt(history, force_submit=False):
     convo_text = "\n".join(f"{m['role']}: {m['text']}" for m in history)
@@ -78,8 +98,8 @@ def build_prompt(history, force_submit=False):
         if force_submit else ""
     )
     return f"""You are the intake assistant for MorisPulse AI, a Mauritian civic-issue
-reporting platform. Citizens may write in Mauritian Creole, French, or English - respond
-in the same language they used.
+reporting platform. Citizens may write in French or English - respond in the same
+language they used.
 
 Location is captured automatically via GPS - never ask the citizen for coordinates,
 addresses, or landmarks.
@@ -115,6 +135,38 @@ def _extract_function_call(response):
     return None
 
 
+def _call_gemma_api(contents):
+    """Primary path: Google's hosted Gemma API."""
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(function_declarations=[ask_followup_tool, submit_report_tool])]
+        ),
+    )
+    call = _extract_function_call(response)
+    if call is None:
+        return {"kind": "text", "text": response.text}
+    return {"kind": "call", "name": call.name, "args": dict(call.args)}
+
+
+def _call_gemma_local(history, force_submit=False):
+    """Fallback path: local E4B via Ollama on your laptop."""
+    prompt = build_prompt(history, force_submit=force_submit)
+    response = local_client.chat.completions.create(
+        model=LOCAL_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        tools=local_tools,
+        tool_choice="auto",
+    )
+    choice = response.choices[0].message
+    if choice.tool_calls:
+        call = choice.tool_calls[0].function
+        args = json.loads(call.arguments or "{}")
+        return {"kind": "call", "name": call.name, "args": args}
+    return {"kind": "text", "text": choice.content}
+
+
 @app.post("/report/{report_id}/message")
 def send_message(report_id: str, body: MessageBody):
     history = conversations.setdefault(report_id, [])
@@ -129,30 +181,29 @@ def send_message(report_id: str, body: MessageBody):
         image_bytes = base64.b64decode(body.image_base64)
         contents.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
 
+    used_fallback = False
     try:
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                tools=[types.Tool(function_declarations=[ask_followup_tool, submit_report_tool])]
-            ),
-        )
+        result = _call_gemma_api(contents)
     except Exception:
-        return {"type": "error", "message": "Something went wrong, please try again."}
+        # API failed (no wifi, rate limit, etc.) — fall back to local E4B on the laptop
+        try:
+            result = _call_gemma_local(history, force_submit=force_submit)
+            used_fallback = True
+        except Exception:
+            return {"type": "error", "message": "Something went wrong, please try again."}
 
-    call = _extract_function_call(response)
+    if result["kind"] == "text":
+        history.append({"role": "assistant", "text": result["text"]})
+        return {"type": "text", "message": result["text"], "fallback_used": used_fallback}
 
-    if call is None:
-        history.append({"role": "assistant", "text": response.text})
-        return {"type": "text", "message": response.text}
+    name, args = result["name"], result["args"]
 
-    if call.name == "ask_followup":
-        question = call.args["question"]
+    if name == "ask_followup":
+        question = args["question"]
         history.append({"role": "assistant", "text": question})
-        return {"type": "question", "question": question}
+        return {"type": "question", "question": question, "fallback_used": used_fallback}
 
-    if call.name == "submit_report":
-        args = dict(call.args)
+    if name == "submit_report":
         loc = locations.get(report_id, {"lat": 0.0, "lng": 0.0})
         lat, lng = loc["lat"], loc["lng"]
 
@@ -160,7 +211,7 @@ def send_message(report_id: str, body: MessageBody):
         if dup:
             dup["confirmations"] += 1
             history.append({"role": "assistant", "text": f"Matched existing report #{dup['id']}"})
-            return {"type": "duplicate", "report": dup}
+            return {"type": "duplicate", "report": dup, "fallback_used": used_fallback}
 
         rid = str(next_id[0])
         next_id[0] += 1
@@ -177,7 +228,7 @@ def send_message(report_id: str, body: MessageBody):
         }
         reports[rid] = report
         history.append({"role": "assistant", "text": f"Submitted as report #{rid}"})
-        return {"type": "submitted", "report": report}
+        return {"type": "submitted", "report": report, "fallback_used": used_fallback}
 
 
 @app.get("/dashboard")
@@ -217,10 +268,11 @@ Respond with ONLY JSON: {"severity": <int 1-5>, "note": "<short update>"}"""
 
     try:
         response = client.models.generate_content(model=MODEL, contents=contents)
+        raw_text = response.text
     except Exception:
         raise HTTPException(503, "Model unavailable, please try again.")
 
-    cleaned = re.sub(r"^```(json)?|```$", "", response.text.strip(), flags=re.MULTILINE).strip()
+    cleaned = re.sub(r"^```(json)?|```$", "", raw_text.strip(), flags=re.MULTILINE).strip()
 
     try:
         result = json.loads(cleaned)

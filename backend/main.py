@@ -1,32 +1,45 @@
+from dotenv import load_dotenv
+load_dotenv()
 import os
 import re
 import json
 import base64
+import uuid
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
 from openai import OpenAI
-from dotenv import load_dotenv
 
-load_dotenv()
+from supabase import create_client, Client
+
+url: str = os.environ.get("SUPABASE_URL")
+key: str = os.environ.get("SUPABASE_KEY")
+supabase: Client = create_client(url, key)
 
 app = FastAPI()
-client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY", "dummy-key"))
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
 
 MODEL = "gemma-4-26b-a4b-it"
 SECRET_KEY = os.environ.get("SECRET_KEY", "hackathon123")
 
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://192.168.1.XXX:11434") 
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "gemma4:e4b-it-q4_K_M")
-
 local_client = OpenAI(base_url=f"{OLLAMA_HOST}/v1", api_key="ollama")
 
 conversations = {}
 locations = {}
 turn_counts = {}
-reports = {}
-next_id = [1]
 
 MAX_TURNS = 4
 
@@ -76,16 +89,16 @@ submit_report_tool = {
     },
 }
 
-# Same tools, OpenAI-format, for the local fallback path
+# Same tools, OpenAI function-calling format, for the local fallback path
 local_tools = [
     {"type": "function", "function": {
         "name": "ask_followup",
-        "description": "Ask the citizen a clarifying question before finalizing the report.",
+        "description": ask_followup_tool["description"],
         "parameters": ask_followup_tool["parameters"],
     }},
     {"type": "function", "function": {
         "name": "submit_report",
-        "description": "Finalize and submit the complaint as a structured report.",
+        "description": submit_report_tool["description"],
         "parameters": submit_report_tool["parameters"],
     }},
 ]
@@ -120,9 +133,19 @@ def distance(lat1, lng1, lat2, lng2):
 
 
 def find_duplicate(category, lat, lng, threshold=0.0045):
-    for r in reports.values():
-        if r["category"] == category and r["status"] != "resolved" \
-                and distance(r["location"]["lat"], r["location"]["lng"], lat, lng) < threshold:
+    try:
+        response = (
+            supabase.table("reports")
+            .select("*")
+            .eq("category", category)
+            .neq("status", "resolved")
+            .execute()
+        )
+    except Exception:
+        return None
+    for r in response.data:
+        loc = r.get("location") or {}
+        if distance(loc.get("lat", 0.0), loc.get("lng", 0.0), lat, lng) < threshold:
             return r
     return None
 
@@ -151,7 +174,7 @@ def _call_gemma_api(contents):
 
 
 def _call_gemma_local(history, force_submit=False):
-    """Fallback path: local E4B via Ollama on your laptop."""
+    """Fallback path: local E4B via Ollama on your laptop, reached over LAN."""
     prompt = build_prompt(history, force_submit=force_submit)
     response = local_client.chat.completions.create(
         model=LOCAL_MODEL,
@@ -184,12 +207,13 @@ def send_message(report_id: str, body: MessageBody):
     used_fallback = False
     try:
         result = _call_gemma_api(contents)
-    except Exception:
-        # API failed (no wifi, rate limit, etc.) — fall back to local E4B on the laptop
+    except Exception as e:
+        print(f"[Gemini API error, falling back to local] {type(e).__name__}: {e}")
         try:
             result = _call_gemma_local(history, force_submit=force_submit)
             used_fallback = True
-        except Exception:
+        except Exception as e2:
+            print(f"[Local fallback also failed] {type(e2).__name__}: {e2}")
             return {"type": "error", "message": "Something went wrong, please try again."}
 
     if result["kind"] == "text":
@@ -209,12 +233,18 @@ def send_message(report_id: str, body: MessageBody):
 
         dup = find_duplicate(args["category"], lat, lng)
         if dup:
-            dup["confirmations"] += 1
+            new_count = dup["confirmations"] + 1
+            try:
+                supabase.table("reports").update(
+                    {"confirmations": new_count}
+                ).eq("id", dup["id"]).execute()
+            except Exception:
+                pass
+            dup["confirmations"] = new_count
             history.append({"role": "assistant", "text": f"Matched existing report #{dup['id']}"})
             return {"type": "duplicate", "report": dup, "fallback_used": used_fallback}
 
-        rid = str(next_id[0])
-        next_id[0] += 1
+        rid = str(uuid.uuid4())
         report = {
             "id": rid,
             "category": args["category"],
@@ -226,29 +256,53 @@ def send_message(report_id: str, body: MessageBody):
             "image_url": None,
             "history": [],
         }
-        reports[rid] = report
+        try:
+            supabase.table("reports").insert(report).execute()
+        except Exception:
+            raise HTTPException(503, "Could not save report to database.")
+
         history.append({"role": "assistant", "text": f"Submitted as report #{rid}"})
         return {"type": "submitted", "report": report, "fallback_used": used_fallback}
 
 
 @app.get("/dashboard")
 def dashboard():
-    return list(reports.values())
+    try:
+        response = supabase.table("reports").select("*").execute()
+    except Exception:
+        raise HTTPException(503, "Could not fetch reports from database.")
+    return response.data
 
 
 @app.post("/report/{report_id}/confirm")
 def confirm(report_id: str):
-    if report_id not in reports:
+    try:
+        existing = supabase.table("reports").select("*").eq("id", report_id).execute()
+    except Exception:
+        raise HTTPException(503, "Could not reach database.")
+    if not existing.data:
         raise HTTPException(404, "Report not found")
-    reports[report_id]["confirmations"] += 1
-    return reports[report_id]
+
+    report = existing.data[0]
+    new_count = report["confirmations"] + 1
+    try:
+        supabase.table("reports").update({"confirmations": new_count}).eq("id", report_id).execute()
+    except Exception:
+        raise HTTPException(503, "Could not update report.")
+
+    report["confirmations"] = new_count
+    return report
 
 
 @app.post("/report/{report_id}/add-info")
 def add_info(report_id: str, body: InfoBody):
-    if report_id not in reports:
+    try:
+        existing = supabase.table("reports").select("*").eq("id", report_id).execute()
+    except Exception:
+        raise HTTPException(503, "Could not reach database.")
+    if not existing.data:
         raise HTTPException(404, "Report not found")
-    report = reports[report_id]
+    report = existing.data[0]
 
     prompt_text = f"""Original report category: {report['category']}, summary: {report['summary']}, current severity: {report['severity']}.
 New info from a volunteer: "{body.info}"."""
@@ -283,11 +337,21 @@ Respond with ONLY JSON: {"severity": <int 1-5>, "note": "<short update>"}"""
         raise HTTPException(400, f"Image rejected: {result.get('image_reason', 'does not match report')}")
 
     report["severity"] = result["severity"]
-    report["history"].append({
+    updated_history = (report.get("history") or []) + [{
         "note": result["note"],
         "severity": result["severity"],
         "image_valid": result.get("image_valid", True),
-    })
+    }]
+    report["history"] = updated_history
+
+    try:
+        supabase.table("reports").update({
+            "severity": result["severity"],
+            "history": updated_history,
+        }).eq("id", report_id).execute()
+    except Exception:
+        raise HTTPException(503, "Could not update report.")
+
     return report
 
 
@@ -295,7 +359,19 @@ Respond with ONLY JSON: {"severity": <int 1-5>, "note": "<short update>"}"""
 def update_status(report_id: str, body: StatusBody, request: Request):
     if request.headers.get("x-secret-key") != SECRET_KEY:
         raise HTTPException(401, "Unauthorized")
-    if report_id not in reports:
+
+    try:
+        existing = supabase.table("reports").select("*").eq("id", report_id).execute()
+    except Exception:
+        raise HTTPException(503, "Could not reach database.")
+    if not existing.data:
         raise HTTPException(404, "Report not found")
-    reports[report_id]["status"] = body.status
-    return reports[report_id]
+
+    try:
+        supabase.table("reports").update({"status": body.status}).eq("id", report_id).execute()
+    except Exception:
+        raise HTTPException(503, "Could not update report.")
+
+    report = existing.data[0]
+    report["status"] = body.status
+    return report

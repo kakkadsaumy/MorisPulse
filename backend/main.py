@@ -89,7 +89,6 @@ submit_report_tool = {
     },
 }
 
-# Same tools, OpenAI function-calling format, for the local fallback path
 local_tools = [
     {"type": "function", "function": {
         "name": "ask_followup",
